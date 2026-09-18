@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "bullmq": "^6.3.6",
+    "ioredis": "^5.11.1",
+    "socket.io": "^4.8.3"
+  }
+}

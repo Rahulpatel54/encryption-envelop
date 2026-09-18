@@ -1,0 +1,68 @@
+Model/rotation-target registration example (after your real models are loaded):
+
+javascript
+const { registerTarget } = require('./app/service/encryption/rotation.registry');
+const { User } = require('../models'); // your actual app models
+
+registerTarget('users.ssn', {
+  model: User,
+  primaryKey: 'id',
+  encryptedFields: ['ssn_encrypted'],
+});
+
+Worker startup/integration (separate process recommended):
+
+javascript
+const { Sequelize } = require('sequelize');
+const sequelize = new Sequelize(process.env.DATABASE_URL);
+const EncryptionKeyModel = require('./app/models/security/encryption.key.model')(sequelize);
+const EncryptionRotationModel = require('./app/models/security/encryption.rotation.model')(sequelize);
+const { KeyService } = require('./app/service/encryption/key.service');
+const { EncryptionService } = require('./app/service/encryption/encryption.service');
+const { createRotationWorker } = require('./app/workers/encryption.rotation.worker');
+require('./app/service/encryption/rotation.targets'); // registers targets as shown above
+
+const keyService = new KeyService({ EncryptionKeyModel });
+const encryptionService = new EncryptionService({ keyService });
+
+createRotationWorker({
+  sequelize,
+  RotationModel: EncryptionRotationModel,
+  encryptionService,
+  keyService,
+});
+
+Express route integration:
+
+javascript
+const { buildEncryptionRoutes } = require('./app/routes/encryption/encryption.routes');
+const { RotationService } = require('./app/service/encryption/rotation.service');
+
+const rotationService = new RotationService({ RotationModel: EncryptionRotationModel, io });
+app.use('/encryption', buildEncryptionRoutes({
+  rotationService,
+  authorize: yourCasbinMiddleware('encryption:rotate'), // plug in real authz here
+}));
+
+Socket.IO integration:
+
+javascript
+const { Server } = require('socket.io');
+const io = new Server(httpServer);
+const { initRotationSocket } = require('./app/service/encryption/rotation.socket');
+initRotationSocket(io);
+
+Minimal frontend example:
+
+javascript
+const socket = io('/encryption-rotations');
+socket.emit('rotation:subscribe', rotationId);
+socket.on('rotation:progress', (p) => updateProgressBar(p.percentage, p.processed, p.total));
+socket.on('rotation:completed', (p) => showDone(p));
+socket.on('rotation:failed', (p) => showError(p.message));
+socket.on('rotation:cancelled', (p) => showCancelled(p));
+
+// on load / reconnect, fetch current state instead of polling:
+fetch(`/encryption/rotations/${rotationId}`).then((r) => r.json()).then(renderStatus);
+
+How it fits together: EncryptionService.encrypt() generates a random 256-bit DEK per call, encrypts your plaintext with AES-256-GCM (unique IV every time), then asks KeyService/KeyProvider to wrap that DEK under the currently active KEK version. The result — ciphertext, IV, tag, wrapped DEK, and which KEK version/provider did the wrapping — is packed into a versioned, self-describing envelope string; that's the only thing ever written to Postgres. Decryption reverses this: look at the envelope's kekVersion, ask the provider to unwrap the DEK under that specific version (old versions keep working as long as their key material is still available), then AES-GCM-decrypt with the recovered DEK, which also authenticates the ciphertext. KEK_REWRAP re-wraps just the DEK under a new KEK version without touching the encrypted payload; DEK_ROTATION fully re-encrypts each record under a brand-new DEK. Both walk the registered target table in cursor-paginated, bounded-transaction batches, checkpointing last_processed_id in Postgres so a crash/restart resumes safely, guarded by a Postgres advisory lock per target so rotations can't race each other, with per-batch progress pushed via BullMQ → QueueEvents → Socket.IO rooms instead of the frontend polling the database.
