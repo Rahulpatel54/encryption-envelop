@@ -1,8 +1,43 @@
-Model/rotation-target registration example (after your real models are loaded):
+1. Copy the files in
+
+Drop the whole app/service/encryption/, app/models/security/, app/migrations/, app/controllers/encryption/, app/routes/encryption/, app/workers/ folders into your existing app/ (or src/) root, merging with whatever's already there. Don't overwrite existing models/index.js, routes/index.js, etc. — you're going to import into them, not replace them.
+
+2. .env (or .env.example)
+
+Add:
+
+ENCRYPTION_KEY_PROVIDER=env
+ENCRYPTION_KEK_VERSION=1
+ENCRYPTION_KEK=<base64 32-byte key>
+ENCRYPTION_ROTATION_BATCH_SIZE=500
+ENCRYPTION_ROTATION_ATTEMPTS=3
+ENCRYPTION_ROTATION_QUEUE_NAME=encryption-rotation
+REDIS_URL=redis://127.0.0.1:6379
+
+Generate a key once: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+
+3. Wherever your Sequelize models are loaded (usually models/index.js)
+
+This is the file that does new Sequelize(...) and loops over model files. Add the two new models there so they get the same sequelize instance as everything else:
 
 javascript
-const { registerTarget } = require('./app/service/encryption/rotation.registry');
-const { User } = require('../models'); // your actual app models
+db.EncryptionKey = require('../app/models/security/encryption.key.model')(sequelize);
+db.EncryptionRotation = require('../app/models/security/encryption.rotation.model')(sequelize);
+
+If your project uses sequelize-cli auto-loading (reads every file in models/), just move/symlink those two model files into your real models/ folder instead — then this step is automatic.
+
+4. Migrations folder
+
+Copy the two migration files into your project's actual migrations/ directory (the one .sequelizerc or config/config.js points at), then:
+
+npx sequelize-cli db:migrate
+5. Register rotation targets — this is the file you'll actually edit most
+
+app/service/encryption/rotation.targets.js is intentionally empty. Add your real models here, e.g. if you have a User model with an encrypted SSN column:
+
+javascript
+const { registerTarget } = require('./rotation.registry');
+const { User, PaymentMethod } = require('../../../models'); // your existing models/index.js export
 
 registerTarget('users.ssn', {
   model: User,
@@ -10,59 +45,62 @@ registerTarget('users.ssn', {
   encryptedFields: ['ssn_encrypted'],
 });
 
-Worker startup/integration (separate process recommended):
+This file must be required once at startup, after models are loaded (see step 7).
 
-javascript
-const { Sequelize } = require('sequelize');
-const sequelize = new Sequelize(process.env.DATABASE_URL);
-const EncryptionKeyModel = require('./app/models/security/encryption.key.model')(sequelize);
-const EncryptionRotationModel = require('./app/models/security/encryption.rotation.model')(sequelize);
-const { KeyService } = require('./app/service/encryption/key.service');
-const { EncryptionService } = require('./app/service/encryption/encryption.service');
-const { createRotationWorker } = require('./app/workers/encryption.rotation.worker');
-require('./app/service/encryption/rotation.targets'); // registers targets as shown above
+6. Wherever you construct your Express app (app.js, server.js, or bootstrap.js)
 
-const keyService = new KeyService({ EncryptionKeyModel });
-const encryptionService = new EncryptionService({ keyService });
-
-createRotationWorker({
-  sequelize,
-  RotationModel: EncryptionRotationModel,
-  encryptionService,
-  keyService,
-});
-
-Express route integration:
+Wherever you currently do app.use('/something', someRoutes):
 
 javascript
 const { buildEncryptionRoutes } = require('./app/routes/encryption/encryption.routes');
 const { RotationService } = require('./app/service/encryption/rotation.service');
 
-const rotationService = new RotationService({ RotationModel: EncryptionRotationModel, io });
+const rotationService = new RotationService({
+  RotationModel: db.EncryptionRotation, // from step 3
+  io, // your existing Socket.IO server instance
+});
+
 app.use('/encryption', buildEncryptionRoutes({
   rotationService,
-  authorize: yourCasbinMiddleware('encryption:rotate'), // plug in real authz here
+  authorize: yourExistingCasbinMiddleware('encryption:rotate'), // your real authz middleware
 }));
+7. Wherever you create your Socket.IO server
 
-Socket.IO integration:
+Right after const io = new Server(httpServer, ...):
 
 javascript
-const { Server } = require('socket.io');
-const io = new Server(httpServer);
 const { initRotationSocket } = require('./app/service/encryption/rotation.socket');
 initRotationSocket(io);
+8. Worker process — new file, e.g. worker.js at project root
 
-Minimal frontend example:
+This runs separately from your API process (own pm2/Docker entry, own node worker.js):
 
 javascript
-const socket = io('/encryption-rotations');
-socket.emit('rotation:subscribe', rotationId);
-socket.on('rotation:progress', (p) => updateProgressBar(p.percentage, p.processed, p.total));
-socket.on('rotation:completed', (p) => showDone(p));
-socket.on('rotation:failed', (p) => showError(p.message));
-socket.on('rotation:cancelled', (p) => showCancelled(p));
+require('dotenv').config();
+const db = require('./models'); // your existing models/index.js — gives you sequelize + all models
+require('./app/service/encryption/rotation.targets'); // step 5 registrations run here
+const { KeyService } = require('./app/service/encryption/key.service');
+const { EncryptionService } = require('./app/service/encryption/encryption.service');
+const { createRotationWorker } = require('./app/workers/encryption.rotation.worker');
 
-// on load / reconnect, fetch current state instead of polling:
-fetch(`/encryption/rotations/${rotationId}`).then((r) => r.json()).then(renderStatus);
+const keyService = new KeyService({ EncryptionKeyModel: db.EncryptionKey });
+const encryptionService = new EncryptionService({ keyService });
 
-How it fits together: EncryptionService.encrypt() generates a random 256-bit DEK per call, encrypts your plaintext with AES-256-GCM (unique IV every time), then asks KeyService/KeyProvider to wrap that DEK under the currently active KEK version. The result — ciphertext, IV, tag, wrapped DEK, and which KEK version/provider did the wrapping — is packed into a versioned, self-describing envelope string; that's the only thing ever written to Postgres. Decryption reverses this: look at the envelope's kekVersion, ask the provider to unwrap the DEK under that specific version (old versions keep working as long as their key material is still available), then AES-GCM-decrypt with the recovered DEK, which also authenticates the ciphertext. KEK_REWRAP re-wraps just the DEK under a new KEK version without touching the encrypted payload; DEK_ROTATION fully re-encrypts each record under a brand-new DEK. Both walk the registered target table in cursor-paginated, bounded-transaction batches, checkpointing last_processed_id in Postgres so a crash/restart resumes safely, guarded by a Postgres advisory lock per target so rotations can't race each other, with per-batch progress pushed via BullMQ → QueueEvents → Socket.IO rooms instead of the frontend polling the database.
+createRotationWorker({
+  sequelize: db.sequelize,
+  RotationModel: db.EncryptionRotation,
+  encryptionService,
+  keyService,
+});
+
+console.log('Encryption rotation worker started');
+
+Add a script for it in package.json:
+
+json
+"scripts": {
+  "worker:rotation": "node worker.js"
+}
+9. Anywhere you already encrypt/decrypt fields (models, services)
+
+Wire EncryptionService the same way as the worker — construct it once (probably in a shared "container"/services/index.js if you have one) and call .encrypt() / .decrypt() from your model hooks or service layer instead of whatever ad hoc crypto exists now.
