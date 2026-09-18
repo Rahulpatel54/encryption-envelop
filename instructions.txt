@@ -104,3 +104,99 @@ json
 9. Anywhere you already encrypt/decrypt fields (models, services)
 
 Wire EncryptionService the same way as the worker — construct it once (probably in a shared "container"/services/index.js if you have one) and call .encrypt() / .decrypt() from your model hooks or service layer instead of whatever ad hoc crypto exists now.
+
+
+                              ┌─────────────────────┐
+                              │   Your Application    │
+                              │  (models, controllers) │
+                              └───────────┬───────────┘
+                                          │ encrypt() / decrypt()
+                                          ▼
+                              ┌─────────────────────┐
+                              │  EncryptionService    │  ← only entry point app code touches
+                              │  - generates DEK       │
+                              │  - AES-256-GCM          │
+                              └───────────┬───────────┘
+                                          │ wrapKey() / unwrapKey() / getActiveKey()
+                                          ▼
+                              ┌─────────────────────┐
+                              │     KeyService         │  ← metadata (encryption_keys table)
+                              │  - createKeyVersion()   │
+                              │  - activateKey()        │
+                              │  - retireKey()          │
+                              └───────────┬───────────┘
+                                          │ delegates to
+                                          ▼
+                              ┌─────────────────────┐
+                              │    KeyProvider (i/f)   │  ← swap point, config-driven
+                              └────────┬─────┬────────┘
+                                       │     │
+                        ┌──────────────┘     └──────────────┐
+                        ▼                                   ▼
+              ┌───────────────────┐                ┌───────────────────┐
+              │  EnvKeyProvider     │                │  KmsKeyProvider     │
+              │  KEK from .env      │                │  needs injected     │
+              │  (fully implemented)│                │  kmsClient adapter  │
+              └───────────────────┘                └───────────────────┘
+                        │                                   │
+                        └───────────────┬───────────────────┘
+                                        ▼
+                              ┌─────────────────────┐
+                              │   Envelope (v1:...)    │  ← what's actually stored
+                              │  kekProvider/version    │
+                              │  wrappedDek + wrapIv/tag│
+                              │  iv + tag + ciphertext  │
+                              └─────────────────────┘
+
+
+                           ── ROTATION SUBSYSTEM ──
+
+  POST /encryption/rotations
+          │
+          ▼
+  RotationController → RotationService.createRotation()
+          │                      │
+          │              writes row to encryption_rotations (QUEUED)
+          │                      │
+          │              enqueues BullMQ job (Queue → Redis)
+          ▼
+  returns 202 immediately (rotationId)
+
+                                          ┌─────────────────────────┐
+  BullMQ Worker (separate process) ──────►  RotationWorker            │
+                                          │  1. pg_try_advisory_lock() │
+                                          │  2. cursor-paginate batch   │
+                                          │     (id > lastProcessedId) │
+                                          │  3. per-batch TRANSACTION:  │
+                                          │     - KEK_REWRAP: unwrap→   │
+                                          │       rewrap DEK only       │
+                                          │     - DEK_ROTATION: decrypt │
+                                          │       → new DEK → encrypt   │
+                                          │     - persist checkpoint    │
+                                          │  4. job.updateProgress()    │
+                                          │  5. release advisory lock   │
+                                          │     when done/on exit       │
+                                          └────────────┬─────────────┘
+                                                       │
+                                          BullMQ "progress"/"completed"/
+                                          "failed" events (Redis)
+                                                       │
+                                                       ▼
+                                          ┌─────────────────────────┐
+                                          │  QueueEvents listener      │
+                                          │  (rotation.socket.js)      │
+                                          └────────────┬─────────────┘
+                                                       │ io.to(`rotation:<id>`).emit(...)
+                                                       ▼
+                                          ┌─────────────────────────┐
+                                          │  Socket.IO room            │
+                                          │  rotation:<rotationId>     │
+                                          └────────────┬─────────────┘
+                                                       ▼
+                                                   Frontend
+                                        (subscribes once, receives
+                                         batch-level progress pushes —
+                                         never polls Postgres)
+
+                              Postgres = durable source of truth throughout
+                              (encryption_keys, encryption_rotations tables)

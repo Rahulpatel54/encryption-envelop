@@ -1,24 +1,23 @@
-'use strict';
+const express = require("express")
+const router = express.Router()
+const { buildRotationController } = require("../../controllers/encryption/encryption.rotation.controller")
+const casbinMiddleware = require("../../middlewares/casbinMiddleware")
+const { RotationService } = require("../../service/encryption/rotation.service")
 
-const express = require('express');
-const { buildRotationController } = require('../../controllers/encryption/encryption.rotation.controller');
+function buildEncryptionRoutes({ RotationModel, io }) {
+  const rotationService = new RotationService({ RotationModel, io })
+  const controller = buildRotationController({ rotationService })
 
-/**
- * @param {object} deps
- * @param {import('../../service/encryption/rotation.service').RotationService} deps.rotationService
- * @param {import('express').RequestHandler} [deps.authorize] plug in the real app's
- *   Casbin/authz middleware here per-route; left as a no-op pass-through by default.
- */
-function buildEncryptionRoutes({ rotationService, authorize }) {
-  const router = express.Router();
-  const controller = buildRotationController({ rotationService });
-  const authz = authorize || ((req, res, next) => next());
+  router.post("/rotations", casbinMiddleware("encryption/rotate"), controller.createRotation)
+  router.get("/rotations/:id", casbinMiddleware("encryption/rotate"), controller.getRotation)
+  router.post("/rotations/:id/cancel", casbinMiddleware("encryption/rotate"), controller.cancelRotation)
 
-  router.post('/rotations', authz, controller.createRotation);
-  router.get('/rotations/:id', authz, controller.getRotation);
-  router.post('/rotations/:id/cancel', authz, controller.cancelRotation);
-
-  return router;
+  return router
 }
 
-module.exports = { buildEncryptionRoutes };
+module.exports = buildEncryptionRoutes
+
+// app/routes/index.js — add
+// const db = require("../models")
+// const buildEncryptionRoutes = require("./encryption/encryption.routes")
+// router.use("/api/encryption", buildEncryptionRoutes({ RotationModel: db.EncryptionRotation }))

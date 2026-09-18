@@ -1,66 +1,55 @@
-'use strict';
-
-const { Model, DataTypes } = require('sequelize');
-
-/**
- * Metadata-only record of a KEK version's lifecycle. Never stores key material.
- */
-module.exports = (sequelize) => {
-  class EncryptionKey extends Model {}
-
-  EncryptionKey.init(
+module.exports = (sequelize, Sequelize) => {
+  const EncryptionKey = sequelize.define(
+    "encryption_keys",
     {
       id: {
-        type: DataTypes.UUID,
-        defaultValue: DataTypes.UUIDV4,
+        type: Sequelize.UUID,
+        defaultValue: Sequelize.UUIDV4,
         primaryKey: true,
       },
       provider: {
-        type: DataTypes.STRING(32),
+        type: Sequelize.STRING(32),
         allowNull: false,
-        validate: { isIn: [['env', 'kms']] },
+        validate: { isIn: [["env", "kms"]] },
       },
       key_type: {
-        type: DataTypes.STRING(16),
+        type: Sequelize.STRING(16),
         allowNull: false,
-        defaultValue: 'KEK',
+        defaultValue: "KEK",
       },
       version: {
-        type: DataTypes.INTEGER,
+        type: Sequelize.INTEGER,
         allowNull: false,
       },
       provider_key_id: {
-        type: DataTypes.STRING(512),
+        type: Sequelize.STRING(512),
         allowNull: true,
       },
       status: {
-        type: DataTypes.STRING(16),
+        type: Sequelize.STRING(16),
         allowNull: false,
-        defaultValue: 'PENDING',
-        validate: { isIn: [['PENDING', 'ACTIVE', 'RETIRED']] },
+        defaultValue: "PENDING",
+        validate: { isIn: [["PENDING", "ACTIVE", "RETIRED"]] },
       },
-      activated_at: { type: DataTypes.DATE, allowNull: true },
-      retired_at: { type: DataTypes.DATE, allowNull: true },
+      activated_at: { type: Sequelize.DATE, allowNull: true },
+      retired_at: { type: Sequelize.DATE, allowNull: true },
       metadata: {
-        type: DataTypes.JSONB,
+        type: Sequelize.JSONB,
         allowNull: false,
         defaultValue: {},
       },
     },
     {
-      sequelize,
-      modelName: 'EncryptionKey',
-      tableName: 'encryption_keys',
       underscored: true,
       timestamps: true,
-      createdAt: 'created_at',
+      createdAt: "created_at",
       updatedAt: false,
       indexes: [
-        { unique: true, fields: ['key_type', 'version'], name: 'uq_encryption_keys_type_version' },
-        { fields: ['status'] },
+        { unique: true, fields: ["key_type", "version"], name: "uq_encryption_keys_type_version" },
+        { fields: ["status"] },
       ],
     }
-  );
+  )
 
-  return EncryptionKey;
-};
+  return EncryptionKey
+}

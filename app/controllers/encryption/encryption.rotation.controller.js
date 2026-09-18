@@ -56,13 +56,18 @@ function buildRotationController({ rotationService }) {
     },
 
     async cancelRotation(req, res) {
-      try {
-        const rotation = await rotationService.cancelRotation(req.params.id);
-        return res.status(200).json(toPublicRotation(rotation));
-      } catch (err) {
-        return res.status(400).json({ error: err.message });
-      }
-    },
+    try {
+        const rotation = await rotationService.cancelRotation(req.params.id)
+        const io = req.app.get("io")
+        if (io) {
+        const { emitCancelled } = require("../../service/encryption/rotation.socket")
+        emitCancelled(io, req.params.id)
+        }
+        return res.status(200).json(toPublicRotation(rotation))
+    } catch (err) {
+        return res.status(400).json({ error: err.message })
+    }
+    }
   };
 }
 

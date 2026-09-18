@@ -1,26 +1,20 @@
+// app/workers/encryption.rotation.worker.js
 'use strict';
 
 const { Worker } = require('bullmq');
+const IORedis = require('ioredis');
 const { Op } = require('sequelize');
 const { getEncryptionConfig } = require('../config/encryption.config');
 const { getTarget } = require('../service/encryption/rotation.registry');
 const { reportProgress, persistCheckpoint } = require('../service/encryption/rotation.progress');
+const envelopeMod = require('../service/encryption/crypto/envelope');
+const { logger } = require('../utils/logger');
 
-/**
- * Acquires a session-level Postgres advisory lock on a dedicated connection,
- * held for the duration of the rotation job so no two conflicting rotations
- * for the same target can run concurrently. Uses hashtext() so any string
- * target key can be used as the lock key. Assumes the `pg` dialect
- * (node-postgres) under Sequelize.
- */
 async function acquireRotationLock(sequelize, lockKeyString) {
   const connection = await sequelize.connectionManager.getConnection({ type: 'write' });
   try {
-    const result = await connection.query('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [
-      lockKeyString,
-    ]);
-    const locked = result.rows[0].locked;
-    if (!locked) {
+    const result = await connection.query('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [lockKeyString]);
+    if (!result.rows[0].locked) {
       sequelize.connectionManager.releaseConnection(connection);
       return null;
     }
@@ -41,18 +35,61 @@ async function releaseRotationLock(sequelize, connection, lockKeyString) {
 }
 
 /**
- * @param {object} deps
- * @param {import('sequelize').Sequelize} deps.sequelize
- * @param {import('sequelize').ModelStatic} deps.RotationModel
- * @param {import('../service/encryption/encryption.service').EncryptionService} deps.encryptionService
- * @param {import('../service/encryption/key.service').KeyService} deps.keyService
- * @returns {import('bullmq').Worker}
+ * Singleton worker matching the EmailWorker shape expected by
+ * app/workers/index.js: start() / stop() / isRunning() / getWorker().
+ * Construct with db + services once at process startup via configure().
  */
-function createRotationWorker({ sequelize, RotationModel, encryptionService, keyService }) {
-  const config = getEncryptionConfig();
+class EncryptionRotationWorker {
+  constructor() {
+    this._worker = null;
+    this._bullmqConnection = null;
+    this._isRunning = false;
+    this._deps = null; // { sequelize, RotationModel, encryptionService, keyService }
+  }
 
-  const processor = async (job) => {
+  /** Call once at process startup before start(), since deps aren't available at require-time. */
+  configure({ sequelize, RotationModel, encryptionService, keyService }) {
+    this._deps = { sequelize, RotationModel, encryptionService, keyService };
+  }
+
+  async start() {
+    if (this._isRunning) {
+      logger.warn('Encryption rotation worker is already running');
+      return;
+    }
+    if (!this._deps) {
+      throw new Error('EncryptionRotationWorker.configure() must be called before start()');
+    }
+
+    const config = getEncryptionConfig();
+
+    this._bullmqConnection = new IORedis({
+      host: config.redis.host,
+      port: config.redis.port,
+      db: config.redis.db,
+      maxRetriesPerRequest: null,
+    });
+
+    this._worker = new Worker(
+      config.rotation.queueName,
+      (job) => this._processJob(job),
+      {
+        connection: this._bullmqConnection,
+        concurrency: 1,
+      }
+    );
+
+    this._attachEventHandlers();
+    await this._worker.waitUntilReady();
+    this._isRunning = true;
+    logger.info('Encryption rotation worker ready', { queue: config.rotation.queueName });
+  }
+
+  async _processJob(job) {
+    const { sequelize, RotationModel, encryptionService, keyService } = this._deps;
+    const config = getEncryptionConfig();
     const { rotationId } = job.data;
+
     const rotation = await RotationModel.findByPk(rotationId);
     if (!rotation) throw new Error(`Rotation ${rotationId} not found`);
     if (rotation.status === 'CANCELLED') return { rotationId, status: 'CANCELLED' };
@@ -60,8 +97,6 @@ function createRotationWorker({ sequelize, RotationModel, encryptionService, key
     const lockKey = `${rotation.type}:${rotation.target}`;
     const lockConnection = await acquireRotationLock(sequelize, lockKey);
     if (!lockConnection) {
-      // Another rotation is actively running for this target. Let BullMQ's
-      // retry/backoff handle re-attempting later rather than racing it.
       throw new Error(`Rotation target "${rotation.target}" is locked by another rotation`);
     }
 
@@ -105,148 +140,166 @@ function createRotationWorker({ sequelize, RotationModel, encryptionService, key
           for (const record of batch) {
             try {
               if (rotation.type === 'KEK_REWRAP') {
-                // eslint-disable-next-line no-await-in-loop
-                await rewrapRecordFields({
-                  record,
-                  fields: targetConfig.encryptedFields,
-                  keyService,
-                  toVersion: rotation.to_version,
-                  transaction: t,
-                });
+                await this._rewrapRecordFields({ record, fields: targetConfig.encryptedFields, keyService, toVersion: rotation.to_version, transaction: t });
               } else {
-                // eslint-disable-next-line no-await-in-loop
-                await rotateDekForRecordFields({
-                  record,
-                  fields: targetConfig.encryptedFields,
-                  encryptionService,
-                  primaryKeyValue: record.get(pkAttr),
-                  transaction: t,
-                });
+                await this._rotateDekForRecordFields({ record, fields: targetConfig.encryptedFields, encryptionService, primaryKeyValue: record.get(pkAttr), transaction: t });
               }
               processed += 1;
             } catch (err) {
               failed += 1;
-              // eslint-disable-next-line no-console
-              console.error('[encryption.rotation.worker] record failed', {
-                rotationId,
-                recordId: record.get(pkAttr),
-                message: err.message,
-              });
+              logger.error('Encryption rotation record failed', { rotationId, recordId: record.get(pkAttr), message: err.message });
             }
             lastId = record.get(pkAttr);
           }
-
-          await persistCheckpoint(
-            RotationModel,
-            rotationId,
-            { processedRecords: processed, failedRecords: failed, lastProcessedId: lastId },
-            t
-          );
+          await persistCheckpoint(RotationModel, rotationId, { processedRecords: processed, failedRecords: failed, lastProcessedId: lastId }, t);
         });
 
         await reportProgress(job, { rotationId, status: 'RUNNING', processed, total, failed });
       }
 
-      await RotationModel.update(
-        { status: 'COMPLETED', completed_at: new Date() },
-        { where: { id: rotationId } }
-      );
+      await RotationModel.update({ status: 'COMPLETED', completed_at: new Date() }, { where: { id: rotationId } });
       await reportProgress(job, { rotationId, status: 'COMPLETED', processed, total, failed });
       return { rotationId, status: 'COMPLETED', processed, failed };
     } catch (err) {
-      await RotationModel.update(
-        { status: 'FAILED', error: String(err.message || err).slice(0, 2000) },
-        { where: { id: rotationId } }
-      );
-      throw err; // let BullMQ apply its retry/backoff policy
+      await RotationModel.update({ status: 'FAILED', error: String(err.message || err).slice(0, 2000) }, { where: { id: rotationId } });
+      throw err;
     } finally {
       await releaseRotationLock(sequelize, lockConnection, lockKey);
     }
-  };
+  }
 
-  const worker = new Worker(config.rotation.queueName, processor, {
-    connection: { url: config.redis.url },
-    concurrency: 1, // one rotation job in flight per worker process; scale via multiple targets/workers
-  });
-
-  worker.on('error', (err) => {
-    // eslint-disable-next-line no-console
-    console.error('[encryption.rotation.worker] worker error', err.message);
-  });
-
-  return worker;
-}
-
-/**
- * KEK_REWRAP: unwrap each field's DEK under the record's current KEK
- * version, re-wrap under `toVersion`, and update ONLY the wrapping portion
- * of the envelope. Ciphertext/IV/tag/DEK are untouched. Idempotent: if a
- * field's envelope is already at `toVersion`, it's skipped.
- */
-async function rewrapRecordFields({ record, fields, keyService, toVersion, transaction }) {
-  const envelopeMod = require('../service/encryption/crypto/envelope');
-  const updates = {};
-
-  for (const field of fields) {
-    const serialized = record.get(field);
-    if (!serialized) continue;
-
-    const env = envelopeMod.deserializeEnvelope(serialized);
-    if (env.kekVersion === toVersion) continue; // already migrated — idempotent skip
-
-    const dek = await keyService.unwrapKey(
-      { wrappedDek: env.wrappedDek, wrapIv: env.wrapIv, wrapTag: env.wrapTag },
-      env.kekVersion
-    );
-    try {
-      const { wrappedDek, wrapIv, wrapTag, providerKeyId } = await keyService.wrapKey(dek, toVersion);
-      const newEnv = envelopeMod.buildEnvelope({
-        kekProvider: env.kekProvider,
-        kekVersion: toVersion,
-        providerKeyId,
-        wrappedDek,
-        wrapIv,
-        wrapTag,
-        iv: env.iv,
-        tag: env.tag,
-        ciphertext: env.ciphertext,
-      });
-      updates[field] = envelopeMod.serializeEnvelope(newEnv);
-    } finally {
-      dek.fill(0);
+  async _rewrapRecordFields({ record, fields, keyService, toVersion, transaction }) {
+    const updates = {};
+    for (const field of fields) {
+      const serialized = record.get(field);
+      if (!serialized) continue;
+      const env = envelopeMod.deserializeEnvelope(serialized);
+      if (env.kekVersion === toVersion) continue;
+      const dek = await keyService.unwrapKey({ wrappedDek: env.wrappedDek, wrapIv: env.wrapIv, wrapTag: env.wrapTag }, env.kekVersion);
+      try {
+        const { wrappedDek, wrapIv, wrapTag, providerKeyId } = await keyService.wrapKey(dek, toVersion);
+        const newEnv = envelopeMod.buildEnvelope({ kekProvider: env.kekProvider, kekVersion: toVersion, providerKeyId, wrappedDek, wrapIv, wrapTag, iv: env.iv, tag: env.tag, ciphertext: env.ciphertext });
+        updates[field] = envelopeMod.serializeEnvelope(newEnv);
+      } finally {
+        dek.fill(0);
+      }
     }
+    if (Object.keys(updates).length > 0) await record.update(updates, { transaction });
   }
 
-  if (Object.keys(updates).length > 0) {
-    await record.update(updates, { transaction });
+  async _rotateDekForRecordFields({ record, fields, encryptionService, primaryKeyValue, transaction }) {
+    const updates = {};
+    for (const field of fields) {
+      const serialized = record.get(field);
+      if (!serialized) continue;
+      const aad = Buffer.from(`${record.constructor.name}:${field}:${primaryKeyValue}`);
+      const plaintext = await encryptionService.decrypt(serialized, { aad });
+      updates[field] = await encryptionService.encrypt(plaintext, { aad });
+      plaintext.fill(0);
+    }
+    if (Object.keys(updates).length > 0) await record.update(updates, { transaction });
+  }
+
+  _attachEventHandlers() {
+    this._worker.on('active', (job) => logger.info('Encryption rotation job active', { jobId: job.id }));
+    this._worker.on('completed', (job) => logger.info('Encryption rotation job completed', { jobId: job.id }));
+    this._worker.on('failed', (job, error) => logger.error('Encryption rotation job failed', { jobId: job?.id, message: error.message }));
+    this._worker.on('error', (error) => logger.error('Encryption rotation worker error', { message: error.message }));
+  }
+
+  async stop() {
+    if (!this._isRunning) return;
+    this._isRunning = false;
+    if (this._worker) {
+      await this._worker.close();
+      this._worker = null;
+    }
+    if (this._bullmqConnection) {
+      await this._bullmqConnection.quit();
+      this._bullmqConnection = null;
+    }
+    logger.info('Encryption rotation worker stopped gracefully');
+  }
+
+  isRunning() {
+    return this._isRunning;
+  }
+
+  getWorker() {
+    return this._worker;
   }
 }
 
-/**
- * Note: I've added AAD binding (ModelName:field:primaryKey) inside the worker's DEK rotation path. If you also bind AAD at initial-encryption time elsewhere in your app, use the exact same AAD convention there, or decryption will fail.
- * DEK_ROTATION: fully decrypt each field with its current DEK and
- * re-encrypt with a freshly generated DEK (wrapped under the currently
- * active KEK). Idempotent in the sense that re-running it simply generates
- * another fresh DEK — safe, if slightly wasteful, on at-least-once retry of
- * a batch that had already partially committed (it cannot partially commit,
- * since each batch is one bounded transaction).
- */
-async function rotateDekForRecordFields({ record, fields, encryptionService, primaryKeyValue, transaction }) {
-  const updates = {};
+const encryptionRotationWorker = new EncryptionRotationWorker();
+module.exports = encryptionRotationWorker;
 
-  for (const field of fields) {
-    const serialized = record.get(field);
-    if (!serialized) continue;
 
-    const aad = Buffer.from(`${record.constructor.name}:${field}:${primaryKeyValue}`);
-    const plaintext = await encryptionService.decrypt(serialized, { aad });
-    updates[field] = await encryptionService.encrypt(plaintext, { aad });
-    plaintext.fill(0);
-  }
+// register in workers/index.js
+// const emailWorker = require('./email.worker');
+// const encryptionRotationWorker = require('./encryption.rotation.worker');
 
-  if (Object.keys(updates).length > 0) {
-    await record.update(updates, { transaction });
-  }
-}
+// // NEW — deps must be wired before start() is called
+// const db = require('../models');
+// const { KeyService } = require('../service/encryption/key.service');
+// const { EncryptionService } = require('../service/encryption/encryption.service');
+// require('../service/encryption/rotation.targets'); // registers targets
 
-module.exports = { createRotationWorker, acquireRotationLock, releaseRotationLock };
+// const keyService = new KeyService({ EncryptionKeyModel: db.EncryptionKey });
+// const encryptionService = new EncryptionService({ keyService });
+// encryptionRotationWorker.configure({
+//   sequelize: db.sequelize,
+//   RotationModel: db.EncryptionRotation,
+//   encryptionService,
+//   keyService,
+// });
+
+// const workers = [
+//   { name: 'email-worker', instance: emailWorker },
+//   { name: 'encryption-rotation-worker', instance: encryptionRotationWorker }, // NEW
+// ];
+
+// add in model/index.js
+// db.EncryptionKey = require("./security/encryption.key.model.js")(sequelize, Sequelize)
+// db.EncryptionRotation = require("./security/encryption.rotation.model.js")(sequelize, Sequelize)
+
+
+
+
+
+// app.js — edit
+// javascript
+// // existing:
+// const io = socketServer(app, server, corsOptions)
+// app.set("io", io)
+
+// // ADD right after:
+// const { initRotationSocket } = require("./app/service/encryption/rotation.socket")
+// initRotationSocket(io)
+
+// rotation.socket.js needs its Redis config fixed the same way as the worker — QueueEvents needs host/port/db, not url:
+
+// javascript
+// // OLD in rotation.socket.js
+// const queueEvents = new QueueEvents(config.rotation.queueName, {
+//   connection: { url: config.redis.url },
+// });
+
+// // NEW
+// const queueEvents = new QueueEvents(config.rotation.queueName, {
+//   connection: {
+//     host: config.redis.host,
+//     port: config.redis.port,
+//     db: config.redis.db,
+//   },
+// });
+
+// Same fix applies to rotation.service.js's Queue construction:
+
+// javascript
+// // OLD
+// this.queue = queue || new Queue(config.rotation.queueName, { connection: { url: config.redis.url } });
+
+// // NEW
+// this.queue = queue || new Queue(config.rotation.queueName, {
+//   connection: { host: config.redis.host, port: config.redis.port, db: config.redis.db },
+// });

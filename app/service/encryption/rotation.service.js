@@ -18,15 +18,14 @@ class RotationService {
    * @param {import('socket.io').Server} deps.io
    * @param {import('bullmq').Queue} [deps.queue] override for tests
    */
-  constructor({ RotationModel, io, queue }) {
-    this.RotationModel = RotationModel;
-    this.io = io;
-    const config = getEncryptionConfig();
-    this.queue =
-      queue ||
-      new Queue(config.rotation.queueName, { connection: { url: config.redis.url } });
-    this._config = config;
-  }
+  constructor({ RotationModel, queue }) {
+        this.RotationModel = RotationModel
+        const config = getEncryptionConfig()
+        this.queue = queue || new Queue(config.rotation.queueName, {
+            connection: { host: config.redis.host, port: config.redis.port, db: config.redis.db },
+        })
+        this._config = config
+    }
 
   /**
    * @param {object} params
