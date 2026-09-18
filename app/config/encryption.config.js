@@ -61,7 +61,7 @@ function getEncryptionConfig() {
       attempts: toInt(process.env.ENCRYPTION_ROTATION_ATTEMPTS, 3),
       queueName: process.env.ENCRYPTION_ROTATION_QUEUE_NAME || 'encryption-rotation',
     },
-    config.redis = {
+    redis : {
       host: process.env.REDIS_HOST || 'redis',
       port: Number(process.env.REDIS_PORT || 6379),
       db: Number(process.env.REDIS_DB || 0),
