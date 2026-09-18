@@ -107,7 +107,7 @@ function buildWorkerTestController({ encryptionService, rotationService, rotatio
       }
     },
 
-    /** GET /test/records -> current in-memory test rows, envelope metadata only (kekVersion/provider) — never decrypts */
+    /** GET /test/records -> current in-memory test rows, envelope metadata only (keyVersion) — never decrypts */
     async listRecords(req, res) {
       const rows = await testModel.findAllPlain();
       const summarized = rows.map((r) => ({ id: r.id, ...encryptionService.inspect(r.value_encrypted) }));
@@ -121,33 +121,28 @@ function buildWorkerTestController({ encryptionService, rotationService, rotatio
     },
 
     /**
-     * POST /test/rotation { type, fromVersion?, toVersion? }
-     * Runs a REAL rotation — RotationService.createRotation() enqueues onto
-     * the actual production BullMQ queue, and (if the worker process is
-     * running) EncryptionRotationWorker picks it up, takes the advisory
-     * lock, rewraps/re-encrypts each in-memory test row in a transaction,
-     * and checkpoints/reports progress exactly as it would for real data.
+     * POST /test/rotation {}
+     * Runs a REAL DEK rotation — RotationService.createRotation() mints the
+     * next DEK version, enqueues onto the actual production BullMQ queue,
+     * and (if the worker process is running) EncryptionRotationWorker picks
+     * it up, takes the advisory lock, re-encrypts each in-memory test row
+     * under the new DEK in a transaction, checkpoints/reports progress, and
+     * activates the new DEK on completion — exactly as it would for real
+     * credential data.
      * Poll GET /encryption/rotations/:id or subscribe to the
      * "rotation:<id>" socket room to watch it happen.
      */
     async startTestRotation(req, res) {
       try {
-        const { type, fromVersion, toVersion } = req.body || {};
-        if (!['KEK_REWRAP', 'DEK_ROTATION'].includes(type)) {
-          return res.status(400).json({ error: 'type must be KEK_REWRAP or DEK_ROTATION' });
-        }
-        const config = getEncryptionConfig();
         const rotation = await rotationService.createRotation({
-          type,
-          provider: config.provider,
           target: testTargetName,
-          fromVersion,
-          toVersion: type === 'KEK_REWRAP' ? toVersion ?? config.kekVersion : toVersion,
           createdBy: 'test-endpoint',
         });
         return res.status(202).json({
           rotationId: rotation.id,
           status: rotation.status,
+          fromVersion: rotation.from_version,
+          toVersion: rotation.to_version,
           pollUrl: `/encryption/rotations/${rotation.id}`,
           socketRoom: `rotation:${rotation.id}`,
         });

@@ -30,8 +30,7 @@ const rotationWorker = require('../../workers/encryption.rotation.worker');
  *     POST /encryption/test/records/seed      { count?, text? } -> seed disposable encrypted rows
  *     GET  /encryption/test/records           -> list in-memory test rows (envelope metadata only)
  *     POST /encryption/test/records/reset     -> clear in-memory test rows
- *     POST /encryption/test/rotation          { type, fromVersion?, toVersion? } -> run a REAL
- *                                                 KEK_REWRAP/DEK_ROTATION job through
+ *     POST /encryption/test/rotation          {} -> run a REAL DEK rotation through
  *                                                 RotationService -> BullMQ -> EncryptionRotationWorker
  *                                                 against the in-memory test rows
  *
@@ -52,7 +51,7 @@ if (process.env.NODE_ENV !== 'production') {
 
   // Reuses the same queue name as the production RotationService, so jobs
   // created here are picked up by the same running worker.
-  const rotationService = new RotationService({ RotationModel: db.EncryptionRotation });
+  const rotationService = new RotationService({ RotationModel: db.EncryptionRotation, keyService });
   const testTargetName = registerInMemoryTestTarget(rotationRegistry);
   const workerController = buildWorkerTestController({
     encryptionService,

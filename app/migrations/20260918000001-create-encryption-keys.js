@@ -9,9 +9,14 @@ module.exports = {
         primaryKey: true,
       },
       provider: { type: Sequelize.STRING(32), allowNull: false },
-      key_type: { type: Sequelize.STRING(16), allowNull: false, defaultValue: 'KEK' },
+      key_type: { type: Sequelize.STRING(16), allowNull: false, defaultValue: 'DEK' },
       version: { type: Sequelize.INTEGER, allowNull: false },
       provider_key_id: { type: Sequelize.STRING(512), allowNull: true },
+      // wrapped DEK material — the actual "envelope" for the key itself.
+      // KEK is never persisted; only what the KEK produced when wrapping a DEK.
+      wrapped_dek: { type: Sequelize.TEXT, allowNull: true },
+      wrap_iv: { type: Sequelize.TEXT, allowNull: true },
+      wrap_tag: { type: Sequelize.TEXT, allowNull: true },
       status: { type: Sequelize.STRING(16), allowNull: false, defaultValue: 'PENDING' },
       activated_at: { type: Sequelize.DATE, allowNull: true },
       retired_at: { type: Sequelize.DATE, allowNull: true },

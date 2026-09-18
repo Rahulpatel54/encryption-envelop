@@ -8,6 +8,7 @@ const { getEncryptionConfig } = require('../config/encryption.config');
 const { getTarget } = require('../service/encryption/rotation.registry');
 const { reportProgress, persistCheckpoint } = require('../service/encryption/rotation.progress');
 const envelopeMod = require('../service/encryption/crypto/envelope');
+const aesGcm = require('../service/encryption/crypto/aes-gcm');
 const { logger } = require('../utils/logger');
 
 async function acquireRotationLock(sequelize, lockKeyString) {
@@ -38,6 +39,11 @@ async function releaseRotationLock(sequelize, connection, lockKeyString) {
  * Singleton worker matching the EmailWorker shape expected by
  * app/workers/index.js: start() / stop() / isRunning() / getWorker().
  * Construct with db + services once at process startup via configure().
+ *
+ * Runs Phase 2 (background migration) of a DEK rotation: batches through a
+ * target's records, re-encrypting each under the rotation's `to_version`
+ * DEK, checkpointing as it goes. Once every batch is done, runs Phase 3
+ * (activate the new DEK, retire the old one) automatically.
  */
 class EncryptionRotationWorker {
   constructor() {
@@ -86,7 +92,7 @@ class EncryptionRotationWorker {
   }
 
   async _processJob(job) {
-    const { sequelize, RotationModel, encryptionService, keyService } = this._deps;
+    const { sequelize, RotationModel, keyService } = this._deps;
     const config = getEncryptionConfig();
     const { rotationId } = job.data;
 
@@ -139,11 +145,14 @@ class EncryptionRotationWorker {
         await sequelize.transaction(async (t) => {
           for (const record of batch) {
             try {
-              if (rotation.type === 'KEK_REWRAP') {
-                await this._rewrapRecordFields({ record, fields: targetConfig.encryptedFields, keyService, toVersion: rotation.to_version, transaction: t });
-              } else {
-                await this._rotateDekForRecordFields({ record, fields: targetConfig.encryptedFields, encryptionService, primaryKeyValue: record.get(pkAttr), transaction: t });
-              }
+              await this._migrateRecordFields({
+                record,
+                fields: targetConfig.encryptedFields,
+                keyService,
+                toVersion: rotation.to_version,
+                primaryKeyValue: record.get(pkAttr),
+                transaction: t,
+              });
               processed += 1;
             } catch (err) {
               failed += 1;
@@ -158,6 +167,12 @@ class EncryptionRotationWorker {
       }
 
       await RotationModel.update({ status: 'COMPLETED', completed_at: new Date() }, { where: { id: rotationId } });
+
+      // Phase 3: activate the new DEK, retire the old one. Old DEK's row
+      // stays in the table (RETIRED, never deleted) for disaster recovery,
+      // late migrations, and compliance retention.
+      await keyService.activateDek(rotation.to_version);
+
       await reportProgress(job, { rotationId, status: 'COMPLETED', processed, total, failed });
       return { rotationId, status: 'COMPLETED', processed, failed };
     } catch (err) {
@@ -168,34 +183,39 @@ class EncryptionRotationWorker {
     }
   }
 
-  async _rewrapRecordFields({ record, fields, keyService, toVersion, transaction }) {
+  /**
+   * Phase 2 per-record work: decrypt each encrypted field under whatever DEK
+   * version currently encrypted it, re-encrypt under `toVersion`, update the
+   * envelope's keyVersion tag. Idempotent: if a field is already tagged
+   * `toVersion` it's skipped, so a retried/resumed job never double-migrates
+   * a record (checkpointing via last_processed_id handles the coarse case;
+   * this handles it even within a batch that gets retried).
+   *
+   * DEK buffers from keyService are cache-owned — never scrubbed here. Only
+   * the decrypted plaintext credential (local, single-use) is zeroed.
+   */
+  async _migrateRecordFields({ record, fields, keyService, toVersion, primaryKeyValue, transaction }) {
     const updates = {};
     for (const field of fields) {
       const serialized = record.get(field);
       if (!serialized) continue;
+
       const env = envelopeMod.deserializeEnvelope(serialized);
-      if (env.kekVersion === toVersion) continue;
-      const dek = await keyService.unwrapKey({ wrappedDek: env.wrappedDek, wrapIv: env.wrapIv, wrapTag: env.wrapTag }, env.kekVersion);
+      if (env.keyVersion === toVersion) continue; // already migrated — safe to skip
+
+      const aad = Buffer.from(`${record.constructor.name}:${field}:${primaryKeyValue}`);
+
+      const { dek: oldDek } = await keyService.getDek(env.keyVersion);
+      const plaintext = aesGcm.decrypt(oldDek, { iv: env.iv, ciphertext: env.ciphertext, tag: env.tag }, aad);
+
       try {
-        const { wrappedDek, wrapIv, wrapTag, providerKeyId } = await keyService.wrapKey(dek, toVersion);
-        const newEnv = envelopeMod.buildEnvelope({ kekProvider: env.kekProvider, kekVersion: toVersion, providerKeyId, wrappedDek, wrapIv, wrapTag, iv: env.iv, tag: env.tag, ciphertext: env.ciphertext });
+        const { dek: newDek } = await keyService.getDek(toVersion);
+        const { iv, ciphertext, tag } = aesGcm.encrypt(newDek, plaintext, aad);
+        const newEnv = envelopeMod.buildEnvelope({ keyVersion: toVersion, iv, tag, ciphertext });
         updates[field] = envelopeMod.serializeEnvelope(newEnv);
       } finally {
-        dek.fill(0);
+        plaintext.fill(0);
       }
-    }
-    if (Object.keys(updates).length > 0) await record.update(updates, { transaction });
-  }
-
-  async _rotateDekForRecordFields({ record, fields, encryptionService, primaryKeyValue, transaction }) {
-    const updates = {};
-    for (const field of fields) {
-      const serialized = record.get(field);
-      if (!serialized) continue;
-      const aad = Buffer.from(`${record.constructor.name}:${field}:${primaryKeyValue}`);
-      const plaintext = await encryptionService.decrypt(serialized, { aad });
-      updates[field] = await encryptionService.encrypt(plaintext, { aad });
-      plaintext.fill(0);
     }
     if (Object.keys(updates).length > 0) await record.update(updates, { transaction });
   }
@@ -233,6 +253,63 @@ class EncryptionRotationWorker {
 const encryptionRotationWorker = new EncryptionRotationWorker();
 module.exports = encryptionRotationWorker;
 
+
+// register in workers/index.js
+// const emailWorker = require('./email.worker');
+// const encryptionRotationWorker = require('./encryption.rotation.worker');
+
+// // NEW — deps must be wired before start() is called
+// const db = require('../models');
+// const { KeyService } = require('../service/encryption/key.service');
+// const { EncryptionService } = require('../service/encryption/encryption.service');
+// require('../service/encryption/rotation.targets'); // registers targets
+
+// const keyService = new KeyService({ EncryptionKeyModel: db.EncryptionKey });
+// const encryptionService = new EncryptionService({ keyService });
+// encryptionRotationWorker.configure({
+//   sequelize: db.sequelize,
+//   RotationModel: db.EncryptionRotation,
+//   encryptionService,
+//   keyService,
+// });
+
+// const workers = [
+//   { name: 'email-worker', instance: emailWorker },
+//   { name: 'encryption-rotation-worker', instance: encryptionRotationWorker }, // NEW
+// ];
+
+// add in model/index.js
+// db.EncryptionKey = require("./security/encryption.key.model.js")(sequelize, Sequelize)
+// db.EncryptionRotation = require("./security/encryption.rotation.model.js")(sequelize, Sequelize)
+
+// app.js — edit
+// javascript
+// // existing:
+// const io = socketServer(app, server, corsOptions)
+// app.set("io", io)
+
+// // ADD right after:
+// const { initRotationSocket } = require("./app/service/encryption/rotation.socket")
+// initRotationSocket(io)
+
+// rotation.socket.js needs its Redis config fixed the same way as the worker — QueueEvents needs host/port/db, not url:
+
+// javascript
+// // OLD in rotation.socket.js
+// const queueEvents = new QueueEvents(config.rotation.queueName, {
+//   connection: { url: config.redis.url },
+// });
+
+// // NEW
+// const queueEvents = new QueueEvents(config.rotation.queueName, {
+//   connection: {
+//     host: config.redis.host,
+//     port: config.redis.port,
+//     db: config.redis.db,
+//   },
+// });
+
+// Same fix applies to rotation.service.js's Queue construction (already applied above).
 
 // register in workers/index.js
 // const emailWorker = require('./email.worker');

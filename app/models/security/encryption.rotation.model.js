@@ -8,9 +8,11 @@ module.exports = (sequelize, Sequelize) => {
         primaryKey: true,
       },
       type: {
+        // this architecture only rotates DEKs (KEK is env/KMS-only and never rotates here)
         type: Sequelize.STRING(16),
         allowNull: false,
-        validate: { isIn: [["KEK_REWRAP", "DEK_ROTATION"]] },
+        defaultValue: "DEK_ROTATION",
+        validate: { isIn: [["DEK_ROTATION"]] },
       },
       status: {
         type: Sequelize.STRING(16),

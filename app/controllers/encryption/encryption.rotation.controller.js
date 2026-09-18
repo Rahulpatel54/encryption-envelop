@@ -12,30 +12,18 @@
  * populated by that point; `created_by` below reads from it defensively.
  */
 
-const ALLOWED_TYPES = ['KEK_REWRAP', 'DEK_ROTATION'];
-
 function buildRotationController({ rotationService }) {
   return {
     async createRotation(req, res) {
       try {
-        const { type, provider, target, fromVersion, toVersion } = req.body || {};
+        const { target } = req.body || {};
 
-        if (!ALLOWED_TYPES.includes(type)) {
-          return res.status(400).json({ error: `type must be one of ${ALLOWED_TYPES.join(', ')}` });
-        }
-        if (!provider || typeof provider !== 'string') {
-          return res.status(400).json({ error: 'provider is required' });
-        }
         if (!target || typeof target !== 'string') {
           return res.status(400).json({ error: 'target is required' });
         }
 
         const rotation = await rotationService.createRotation({
-          type,
-          provider,
           target,
-          fromVersion,
-          toVersion,
           createdBy: req.user?.id ?? null, // integration point for real auth/user context
         });
 

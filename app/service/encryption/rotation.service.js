@@ -10,52 +10,57 @@ const { emitCancelled } = require('./rotation.socket');
  * RotationService: business-logic facade over the encryption_rotations
  * table + BullMQ queue. Controllers talk to this, never to BullMQ or the
  * worker directly.
+ *
+ * Owns Phase 1 of a DEK rotation: generate the new (PENDING) DEK version via
+ * KeyService, snapshot the current ACTIVE version as `from_version`, log the
+ * rotation as QUEUED/IN_PROGRESS, and enqueue the background migration job.
+ * Phase 2 (batch migration) runs in the worker; Phase 3 (activate new DEK,
+ * retire old one) runs in the worker once migration completes.
  */
 class RotationService {
   /**
    * @param {object} deps
    * @param {import('sequelize').ModelStatic} deps.RotationModel
-   * @param {import('socket.io').Server} deps.io
+   * @param {import('./key.service').KeyService} deps.keyService
    * @param {import('bullmq').Queue} [deps.queue] override for tests
    */
-  constructor({ RotationModel, queue }) {
-        this.RotationModel = RotationModel
-        const config = getEncryptionConfig()
-        this.queue = queue || new Queue(config.rotation.queueName, {
-            connection: { host: config.redis.host, port: config.redis.port, db: config.redis.db },
-        })
-        this._config = config
-    }
+  constructor({ RotationModel, keyService, queue }) {
+    this.RotationModel = RotationModel
+    this.keyService = keyService
+    const config = getEncryptionConfig()
+    this.queue = queue || new Queue(config.rotation.queueName, {
+        connection: { host: config.redis.host, port: config.redis.port, db: config.redis.db },
+    })
+    this._config = config
+  }
 
   /**
+   * Kicks off a DEK rotation for a registered target.
    * @param {object} params
-   * @param {'KEK_REWRAP'|'DEK_ROTATION'} params.type
-   * @param {string} params.provider
    * @param {string} params.target registered target name
-   * @param {number} [params.fromVersion]
-   * @param {number} [params.toVersion]
    * @param {string} [params.createdBy] integration point for the app's own authz layer
    *   (e.g. pass the authenticated principal's id here; this service does not
    *   itself authorize the request — see controller for the integration point)
    */
-  async createRotation({ type, provider, target, fromVersion, toVersion, createdBy }) {
-    if (!['KEK_REWRAP', 'DEK_ROTATION'].includes(type)) {
-      throw new Error(`RotationService: invalid rotation type "${type}"`);
-    }
+  async createRotation({ target, createdBy }) {
     const targetConfig = getTarget(target);
     if (!targetConfig) {
       throw new Error(`RotationService: unknown rotation target "${target}"`);
     }
 
+    // Phase 1: snapshot current active DEK, mint the next one as PENDING.
+    const { version: fromVersion } = await this.keyService.getActiveDek();
+    const { version: toVersion } = await this.keyService.generateDek();
+
     const total = await targetConfig.model.count();
 
     const rotation = await this.RotationModel.create({
-      type,
+      type: 'DEK_ROTATION',
       status: 'QUEUED',
-      provider,
+      provider: this._config.provider,
       target,
-      from_version: fromVersion ?? null,
-      to_version: toVersion ?? null,
+      from_version: fromVersion,
+      to_version: toVersion,
       total_records: total,
       processed_records: 0,
       failed_records: 0,
@@ -90,6 +95,9 @@ class RotationService {
    * Requests cancellation. Sets status=CANCELLED (checked by the worker
    * between batches so it can stop gracefully rather than being killed
    * mid-transaction) and attempts to remove the job if it hasn't started.
+   * The PENDING DEK version minted in Phase 1 is left in place (RETIRED
+   * never happens for it since it's never activated) — harmless, and
+   * available if the rotation is retried later with the same target.
    */
   async cancelRotation(id) {
     const rotation = await this.RotationModel.findByPk(id);
