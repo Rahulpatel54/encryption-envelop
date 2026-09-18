@@ -200,3 +200,70 @@ Wire EncryptionService the same way as the worker — construct it once (probabl
 
                               Postgres = durable source of truth throughout
                               (encryption_keys, encryption_rotations tables)
+
+
+## Session Context: Envelope Encryption + Key Rotation Module
+
+### Goal
+Standalone encryption/key-management module for a Node.js + Express + PostgreSQL + Sequelize backend. Envelope encryption (AES-256-GCM DEK wrapped by a versioned KEK), pluggable KeyProvider (env fully implemented, KMS as adapter interface only), BullMQ+Redis async/resumable key rotation, Socket.IO push-based progress (no polling).
+
+### Status: **Code fully written + wired into the real codebase. Testing phase now.**
+
+---
+
+### Files created (all content given in full earlier in this session)
+```
+app/config/encryption.config.js
+app/service/encryption/crypto/aes-gcm.js
+app/service/encryption/crypto/envelope.js
+app/service/encryption/providers/key.provider.js   (interface)
+app/service/encryption/providers/env.provider.js     (fully implemented)
+app/service/encryption/providers/kms.provider.js     (adapter shell, needs kmsClient injected — not implemented)
+app/service/encryption/key.service.js
+app/service/encryption/encryption.service.js
+app/service/encryption/rotation.registry.js
+app/service/encryption/rotation.targets.js           (empty — wiring point for real models, NOT yet filled in)
+app/service/encryption/rotation.progress.js
+app/service/encryption/rotation.socket.js
+app/service/encryption/rotation.service.js
+app/workers/encryption.rotation.worker.js             (rewritten as singleton class matching EmailWorker shape)
+app/controllers/encryption/encryption.rotation.controller.js
+app/routes/encryption/encryption.routes.js
+app/models/security/encryption.key.model.js            (rewritten to sequelize.define style)
+app/models/security/encryption.rotation.model.js       (rewritten to sequelize.define style)
+app/migrations/*-create-encryption-keys.js
+app/migrations/*-create-encryption-rotations.js
+test/*.test.js (jest unit tests — aes-gcm, encryption.service, env.provider, rotation.rewrap, rotation.service, rotation.progress) — ALL PASSING
+scripts/test-encryption-e2e.js  (full pipeline smoke test — NOT YET RUN)
+scripts/test-socket.html (manual Socket.IO visual test page)
+```
+
+### Key architectural facts to remember
+- **Envelope format**: `"v1:" + base64(JSON)` containing `kekProvider`, `kekVersion`, `wrappedDek`, `wrapIv`, `wrapTag`, `iv`, `tag`, `ciphertext`. Self-describing — decrypt() reads `kekVersion` from the envelope itself.
+- **AAD convention** (critical, must stay consistent everywhere): `` `${record.constructor.name}:${field}:${primaryKeyValue}` `` — used in worker's DEK rotation. Any code that encrypts fields outside the worker must use this exact same AAD format or decryption breaks.
+- **Rotation types**: `KEK_REWRAP` (only rewraps the wrapped DEK, ciphertext untouched) vs `DEK_ROTATION` (full decrypt/re-encrypt with fresh DEK). Both use cursor pagination (`WHERE id > lastId ORDER BY id LIMIT batchSize`), bounded per-batch transactions, Postgres advisory lock (`pg_try_advisory_lock(hashtext(type:target))`) to prevent concurrent conflicting rotations on the same target.
+- **Rotation targets are never auto-discovered** — must be explicitly registered via `registerTarget()` in `rotation.targets.js`. **This file is currently empty — nothing is registered yet for the real production models.**
+- **Never destroys/retires KEK automatically** — `keyService.retireKey()` must be called manually after confirming no data depends on the old version.
+
+### Codebase-specific integration decisions made (mismatches found & fixed)
+1. **Redis config mismatch**: App uses `REDIS_HOST`/`REDIS_PORT`/`REDIS_DB` (not `REDIS_URL`). Fixed `encryption.config.js`, `rotation.socket.js` (QueueEvents), and `rotation.service.js` (Queue) to use `{ host, port, db }` connection objects instead of a URL string.
+2. **`.env` had typo/duplication**: `ENCRYPTION_KSM_KEY_ID` should be `ENCRYPTION_KMS_KEY_ID`; duplicate `ENCRYPTION_KEK`/`ENCRYPTION_ROTATION_BATCH_SIZE` blocks need collapsing. **User confirmed `ENCRYPTION_MASTER_KEY` is dead/unused — ignore it, no legacy encryption system to reconcile with.**
+3. **Worker shape**: Codebase's `app/workers/index.js` expects singleton objects with `.start()/.stop()/.isRunning()/.getWorker()` (see `EmailWorker` pattern). Rewrote `encryption.rotation.worker.js` as a class (`EncryptionRotationWorker`) with a `.configure({sequelize, RotationModel, encryptionService, keyService})` method called once at startup before `.start()`, matching that convention. Needs to be added to the `workers` array in `app/workers/index.js` (shown, not yet confirmed applied by user).
+4. **Sequelize model style**: Codebase uses `sequelize.define(tableName, attrs, options)` with `(sequelize, Sequelize) => {...}` signature — NOT `class extends Model` / `Model.init()`. Both security models rewritten to match.
+5. **Socket.IO**: Existing `socket.js` (`attachSockets`) uses default namespace with mandatory `userId` handshake auth, disconnecting unauthenticated sockets. Rotation sockets deliberately use a **separate namespace** (`/encryption-rotations`) via `io.of(...)` to avoid that auth requirement — **flagged as a decision needing explicit sign-off**: rotation progress currently has NO auth/room-join restriction. Call `initRotationSocket(io)` in `app.js` right after `socketServer(app, server, corsOptions)` returns `io`.
+6. **Routes/DI pattern**: `io` isn't available in `routes/index.js` at require-time. Resolved by having the controller read `req.app.get("io")` at request time (app.js already does `app.set("io", io)`) rather than injecting `io` into `RotationService`'s constructor. `RotationService` constructor simplified to `{ RotationModel, queue }` only — cancellation's socket emit moved into the controller.
+7. **Casbin**: `encryption.routes.js` written assuming `casbinMiddleware("resource/action")` call signature based on other route files — **NOT YET CONFIRMED**, user was asked to paste `middlewares/casbinMiddleware.js` but hasn't yet. Don't assume this is correct until verified.
+8. **Logger**: Assumed `const { logger } = require('../utils/logger')` pattern (matches `email.worker.js`) — used in rewritten worker.
+9. **Models index**: Need to add `db.EncryptionKey` / `db.EncryptionRotation` requires to `app/models/index.js` (shown, not yet confirmed applied).
+10. Migrations: user said they've got this handled themselves — don't worry about `.sequelizerc`/migration path.
+
+### Still open / unconfirmed
+- `middlewares/casbinMiddleware.js` — never received; route-level authz wiring is unverified.
+- `rotation.targets.js` — still empty; no real production models registered yet.
+- `scripts/test-encryption-e2e.js` — written but **not yet executed** by the user. This is the immediate next step.
+- Cross-version KEK_REWRAP (actual version 1→2 with two real KEKs) not yet tested — current e2e script only tests same-version rewrap (proves mechanism, not true migration). Needs a second key + `legacyKeys` config to test properly.
+- Worker registration in `app/workers/index.js` and model registration in `app/models/index.js` — diffs provided but not confirmed as applied.
+- `.env` cleanup (collapsing duplicates, fixing KSM→KMS typo) — provided but not confirmed as applied.
+
+### Immediate next step
+Run `npm run test:e2e:encryption` (script added to `package.json`), report output/failures, then debug from there. After that: manual crash/kill -9 resume test, then Socket.IO visual test via `scripts/test-socket.html`, then casbin middleware confirmation, then real target registration in `rotation.targets.js`.
